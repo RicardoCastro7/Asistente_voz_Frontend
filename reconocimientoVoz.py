@@ -34,7 +34,7 @@ def clear_audio_queue(qobj: queue.Queue):
 PIPER_MODEL_PATH ="C:/Users/r-ica/OneDrive/Desktop/PRUEBAS/piper_voices/es_MX-claude-high.onnx"
 voice = PiperVoice.load(PIPER_MODEL_PATH)
 
-API_URL = "http://192.168.100.17:7890/pregunta"
+API_URL = "http://192.168.100.37:7890/rag"
 
 # =================== CONFIG ===================
 WAKE_WORD = "alexa"  # en minúsculas
