@@ -18,4 +18,4 @@ def stream():
 if __name__ == "__main__":
     th = threading.Thread(target=audio_worker, daemon=True)
     th.start()
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)

@@ -12,18 +12,24 @@ from piper import PiperVoice
 from event import log, update_state, show_transcript, show_answer
 
 # ========== CONFIG ==========
-PIPER_MODEL_PATH = "C:/Users/r-ica/OneDrive/Desktop/PRUEBAS/piper_voices/es_MX-claude-high.onnx"
-API_URL = "http://192.168.100.37:7890/rag"
+PIPER_MODEL_PATH = "C:/Users/r-ica/OneDrive/Desktop/frontend/Asistente_voz/piper_voices/es_MX-claude-high.onnx"
+API_URL = "http://192.168.100.37:5000/rag"
 WAKE_WORD = "alexa"
-VOSK_MODEL_PATH = r"C:/Users/r-ica/OneDrive/Desktop/PRUEBAS/vosk-model-small-es-0.42"
+VOSK_MODEL_PATH = r"C:/Users/r-ica/OneDrive/Desktop/frontend/Asistente_voz/vosk-model-small-es-0.42"
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
 FRAME_MS = 20
-VAD_AGGRESSIVENESS = 2
+
+# Más agresivo para reducir ruido como voz
+VAD_AGGRESSIVENESS = 3
+
 START_SPEECH_FRAMES = 8
 END_SILENCE_FRAMES = 25
 MAX_UTTER_SILENCE = 8.0
+
+# Tiempo mínimo de escucha después de detectar la wake word
+MIN_RECORDING_TIME = 4.0
 
 MODEL_NAME = "small"
 DEVICE = "cpu"
@@ -34,6 +40,9 @@ TMP_WAV = Path("utter_tmp.wav")
 
 STREAM_ACTIVE = True
 audio_q: queue.Queue | None = None
+
+# Flags para TTS
+TTS_PLAYING = False
 
 voice = PiperVoice.load(PIPER_MODEL_PATH)
 # ============================
@@ -48,17 +57,29 @@ def clear_audio_queue(qobj: queue.Queue):
 
 
 def tts_say(text: str):
+    """
+    Reproduce el texto con Piper.
+    Mientras habla, se PAUSA la captura de audio (STREAM_ACTIVE = False)
+    para evitar que el TTS dispare la wake word.
+    """
     if not text:
         return
 
     def _worker(msg: str):
-        global STREAM_ACTIVE, audio_q
+        global audio_q, TTS_PLAYING, STREAM_ACTIVE
+
         try:
+            TTS_PLAYING = True
+
+            # Pausar captura de audio
             STREAM_ACTIVE = False
+
+            # Sintetizar a WAV en memoria
             buf = io.BytesIO()
             with wave.open(buf, "wb") as wav_out:
                 voice.synthesize_wav(msg, wav_out)
             buf.seek(0)
+
             with wave.open(buf, "rb") as wav_in:
                 nframes = wav_in.getnframes()
                 framerate = wav_in.getframerate()
@@ -78,16 +99,24 @@ def tts_say(text: str):
                 elif sampwidth == 4:
                     audio = audio.astype(np.float32) / 2147483648.0
 
+            # Aseguramos forma (frames, channels)
             if nchannels > 1:
                 audio = audio.reshape(-1, nchannels)
+            else:
+                audio = audio.reshape(-1, 1)
 
+            # Reproducimos de una
             sd.play(audio, framerate)
             sd.wait()
+
         finally:
-            time.sleep(0.8)
+            TTS_PLAYING = False
+            # Reanudar escucha
+            STREAM_ACTIVE = True
+            time.sleep(0.2)
             if audio_q is not None:
                 clear_audio_queue(audio_q)
-            STREAM_ACTIVE = True
+
 
     threading.Thread(target=_worker, args=(text,), daemon=True).start()
 
@@ -131,9 +160,6 @@ def send_to_api(query_text: str):
 
         # --- caso JSON {pregunta: ..., respuesta: ...} ---
         if isinstance(data, dict):
-            # la API te la manda, pero NO la volvemos a mostrar
-            # pregunta_api = (data.get("pregunta") or "").strip()
-
             respuesta = (
                 data.get("respuesta")
                 or data.get("answer")
@@ -144,7 +170,6 @@ def send_to_api(query_text: str):
             if not respuesta:
                 respuesta = "La API no devolvió respuesta."
 
-            # aquí sí mostramos SOLO la respuesta
             show_answer(respuesta)
             tts_say(respuesta)
             return respuesta
@@ -176,7 +201,7 @@ def audio_worker():
     whisper = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
     vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
 
-    global audio_q, STREAM_ACTIVE
+    global audio_q, STREAM_ACTIVE, TTS_PLAYING
     audio_q = queue.Queue()
     frame_len = int(SAMPLE_RATE * (FRAME_MS / 1000.0))
 
@@ -189,8 +214,8 @@ def audio_worker():
     voice_frames = 0
     utter_pcm = bytearray()
     last_voice_t = time.time()
+    recording_start_t = None
 
-    import sounddevice as sd
     with sd.InputStream(
         channels=CHANNELS,
         samplerate=SAMPLE_RATE,
@@ -205,36 +230,41 @@ def audio_worker():
             except queue.Empty:
                 continue
 
+            # Si el stream está "pausado" (TTS), no procesar
             if not STREAM_ACTIVE:
                 continue
 
             mono = buf[:, 0]
             pcm16 = float32_to_pcm16(mono)
 
+            # ==================== ESTADO: WAITING (wake word) ====================
             if state == "waiting":
+                # Si está hablando (por seguridad extra), no buscamos wake word
+                if TTS_PLAYING:
+                    continue
+
+                # Solo usamos el resultado FINAL de Vosk
                 if rec.AcceptWaveform(pcm16):
                     res = json.loads(rec.Result())
                     text = (res.get("text") or "").strip().lower()
-                    if WAKE_WORD in text.split():
-                        log("Wake word detectada (final).")
-                        update_state("Grabando…")
-                        state = "recording"
-                        utter_pcm.clear()
-                        ring = [0] * END_SILENCE_FRAMES
-                        voice_frames = 0
-                        last_voice_t = time.time()
-                else:
-                    part = json.loads(rec.PartialResult()).get("partial", "").lower()
-                    if WAKE_WORD in part.split():
-                        log("Wake word detectada (parcial).")
-                        update_state("Grabando…")
-                        state = "recording"
-                        utter_pcm.clear()
-                        ring = [0] * END_SILENCE_FRAMES
-                        voice_frames = 0
-                        last_voice_t = time.time()
+                    log(f"Vosk final (wake): {text!r}")
 
+                    # Solo activamos si es EXACTAMENTE "alexa"
+                    if text == WAKE_WORD:
+                        log("Wake word detectada (final, match exacto).")
+
+                        update_state("Grabando…")
+                        state = "recording"
+                        utter_pcm.clear()
+                        ring = [0] * END_SILENCE_FRAMES
+                        voice_frames = 0
+                        last_voice_t = time.time()
+                        recording_start_t = time.time()
+                # No usamos PartialResult para evitar falsos positivos
+
+            # ==================== ESTADO: RECORDING (captura pregunta) ====================
             elif state == "recording":
+                # VAD para detectar voz/silencio
                 is_speech = vad.is_speech(pcm16, SAMPLE_RATE)
                 ring = (ring + [1 if is_speech else 0])[-END_SILENCE_FRAMES:]
 
@@ -249,25 +279,64 @@ def audio_worker():
                     last_voice_t = time.time()
 
                 no_voice_window = all(v == 0 for v in ring)
-                if no_voice_window or (time.time() - last_voice_t) > MAX_UTTER_SILENCE:
-                    update_state("Transcribiendo…")
-                    log("Silencio detectado, transcribiendo…")
-                    pcm16_to_wav(bytes(utter_pcm), TMP_WAV)
-                    try:
-                        segments, info = whisper.transcribe(str(TMP_WAV), language=LANG, task="transcribe")
-                        text = " ".join(s.text.strip() for s in segments if s.text.strip())
-                        show_transcript(text)
-                       # log(f"Transcripción: {text}")
-                        if text.strip():
-                            send_to_api(text)
-                    except Exception as e:
-                        log(f"Error transcribiendo: {e}")
-                    finally:
-                        try:
-                            TMP_WAV.unlink(missing_ok=True)
-                        except Exception:
-                            pass
+                elapsed_recording = (
+                    time.time() - recording_start_t if recording_start_t else 0.0
+                )
 
-                    update_state("Esperando wake word: 'ALEXA'")
+                # Solo cerramos si:
+                # - hay silencio o se pasó el límite de utterance
+                # - y ya escuchamos al menos MIN_RECORDING_TIME
+                if (no_voice_window or (time.time() - last_voice_t) > MAX_UTTER_SILENCE) and (
+                    elapsed_recording >= MIN_RECORDING_TIME
+                ):
+                    update_state("Transcribiendo…")
+                    log("Silencio detectado, evaluando utterance…")
+
+                    # Si casi no hubo voz real, no enviamos nada
+                    if voice_frames < START_SPEECH_FRAMES:
+                        log(
+                            "No se detectó voz suficiente tras la wake word. "
+                            "Se cierra sin enviar nada a la API."
+                        )
+                    else:
+                        # ---- FILTRO POR DURACIÓN (para evitar alucinaciones) ----
+                        duration_sec = len(utter_pcm) / (SAMPLE_RATE * 2)
+                        log(f"Duración utterance: {duration_sec:.2f} s")
+
+                        if duration_sec < 0.7:
+                            log("Utterance demasiado corta, se ignora (posible ruido/silencio).")
+                        else:
+                            pcm16_to_wav(bytes(utter_pcm), TMP_WAV)
+                            try:
+                                segments, info = whisper.transcribe(
+                                    str(TMP_WAV), language=LANG, task="transcribe"
+                                )
+                                text = " ".join(
+                                    s.text.strip() for s in segments if s.text.strip()
+                                )
+                                show_transcript(text)
+
+                                # ---- FILTRO POR LONGITUD DE TEXTO ----
+                                if text.strip() and len(text.split()) >= 3:
+                                    log(f"Transcripción válida: {text!r}")
+                                    send_to_api(text)
+                                else:
+                                    log(f"Texto muy corto/ruidoso, se ignora: {text!r}")
+
+                            except Exception as e:
+                                log(f"Error transcribiendo: {e}")
+                            finally:
+                                try:
+                                    TMP_WAV.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+
+                    # Resetear para esperar nueva wake word
+                    update_state("Esperando wake word: 'alexa'")
                     rec = create_vosk_recognizer()
                     state = "waiting"
+                    utter_pcm.clear()
+                    ring = [0] * END_SILENCE_FRAMES
+                    voice_frames = 0
+                    last_voice_t = time.time()
+                    recording_start_t = None
